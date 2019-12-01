@@ -1,18 +1,27 @@
+use crate::endpoint_memory::{BufferDescriptor, EndpointBuffer, EndpointMemoryAllocator, UsbAccessType};
+use crate::registers::UsbRegisters;
+use crate::UsbPeripheral;
+use core::marker::PhantomData;
 use core::mem;
-use cortex_m::interrupt::{self, Mutex, CriticalSection};
-use usb_device::{Result, UsbError};
+use cortex_m::interrupt::{self, CriticalSection, Mutex};
 use usb_device::endpoint::EndpointType;
-use crate::target::{UsbRegisters, usb, UsbAccessType};
-use crate::endpoint_memory::{EndpointBuffer, BufferDescriptor, EndpointMemoryAllocator};
+use usb_device::{Result, UsbError};
 
+// Use bundled register definitions instead of device-specific ones
+// This should work because register definitions from newer chips seem to be
+// compatible with definitions for older ones.
+pub use crate::pac::usb;
+
+pub const NUM_ENDPOINTS: usize = 8;
 
 /// Arbitrates access to the endpoint-specific registers and packet buffer memory.
 #[derive(Default)]
-pub struct Endpoint {
+pub struct Endpoint<USB> {
     out_buf: Option<Mutex<EndpointBuffer>>,
     in_buf: Option<Mutex<EndpointBuffer>>,
     ep_type: Option<EndpointType>,
     index: u8,
+    _marker: PhantomData<USB>,
 }
 
 pub fn calculate_count_rx(mut size: usize) -> Result<(usize, u16)> {
@@ -35,13 +44,14 @@ pub fn calculate_count_rx(mut size: usize) -> Result<(usize, u16)> {
     }
 }
 
-impl Endpoint {
-    pub fn new(index: u8) -> Endpoint {
-        Endpoint {
+impl<USB: UsbPeripheral> Endpoint<USB> {
+    pub fn new(index: u8) -> Self {
+        Self {
             out_buf: None,
             in_buf: None,
             ep_type: None,
             index,
+            _marker: PhantomData,
         }
     }
 
@@ -58,7 +68,7 @@ impl Endpoint {
     }
 
     pub fn set_out_buf(&mut self, buffer: EndpointBuffer, size_bits: u16) {
-        let offset = buffer.offset();
+        let offset = buffer.offset::<USB>();
         self.out_buf = Some(Mutex::new(buffer));
 
         let descr = self.descr();
@@ -71,7 +81,7 @@ impl Endpoint {
     }
 
     pub fn set_in_buf(&mut self, buffer: EndpointBuffer) {
-        let offset = buffer.offset();
+        let offset = buffer.offset::<USB>();
         self.in_buf = Some(Mutex::new(buffer));
 
         let descr = self.descr();
@@ -80,17 +90,18 @@ impl Endpoint {
     }
 
     fn descr(&self) -> &'static BufferDescriptor {
-        EndpointMemoryAllocator::buffer_descriptor(self.index)
+        EndpointMemoryAllocator::<USB>::buffer_descriptor(self.index)
     }
 
     fn reg(&self) -> &'static usb::EPR {
-        UsbRegisters::ep_register(self.index)
+        UsbRegisters::<USB>::ep_register(self.index)
     }
 
+    #[rustfmt::skip]
     pub fn configure(&self, cs: &CriticalSection) {
         let ep_type = match self.ep_type {
             Some(t) => t,
-            None => { return },
+            None => return,
         };
 
         self.reg().modify(|_, w| {
@@ -106,13 +117,23 @@ impl Endpoint {
                 .ea().bits(self.index)
         });
 
-        self.set_stat_rx(cs,
-            if self.out_buf.is_some() { EndpointStatus::Valid }
-            else { EndpointStatus::Disabled} );
+        self.set_stat_rx(
+            cs,
+            if self.out_buf.is_some() {
+                EndpointStatus::Valid
+            } else {
+                EndpointStatus::Disabled
+            },
+        );
 
-        self.set_stat_tx(cs,
-            if self.in_buf.is_some() { EndpointStatus::Nak }
-            else { EndpointStatus::Disabled} );
+        self.set_stat_tx(
+            cs,
+            if self.in_buf.is_some() {
+                EndpointStatus::Nak
+            } else {
+                EndpointStatus::Disabled
+            },
+        );
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
@@ -127,7 +148,7 @@ impl Endpoint {
 
             match reg.read().stat_tx().bits().into() {
                 EndpointStatus::Valid | EndpointStatus::Disabled => return Err(UsbError::WouldBlock),
-                _ => {},
+                _ => {}
             };
 
             in_buf.write(buf);
@@ -174,6 +195,7 @@ impl Endpoint {
     /// conditions, there are invariant values for the fields that may be modified by the hardware
     /// that can be written to avoid modifying other fields while modifying a single field. This
     /// method sets all the volatile fields to their invariant values.
+    #[rustfmt::skip]
     fn set_invariant_values(w: &mut usb::epr::W) -> &mut usb::epr::W {
         w
             .ctr_rx().set_bit()
@@ -185,28 +207,28 @@ impl Endpoint {
     }
 
     pub fn clear_ctr_rx(&self, _cs: &CriticalSection) {
-        self.reg().modify(|_, w|
-            Self::set_invariant_values(w)
-                .ctr_rx().clear_bit());
+        self.reg()
+            .modify(|_, w| Self::set_invariant_values(w).ctr_rx().clear_bit());
     }
 
     pub fn clear_ctr_tx(&self, _cs: &CriticalSection) {
-        self.reg().modify(|_, w|
-            Self::set_invariant_values(w)
-                .ctr_tx().clear_bit());
+        self.reg()
+            .modify(|_, w| Self::set_invariant_values(w).ctr_tx().clear_bit());
     }
 
     pub fn set_stat_rx(&self, _cs: &CriticalSection, status: EndpointStatus) {
         self.reg().modify(|r, w| {
             Self::set_invariant_values(w)
-                .stat_rx().bits(r.stat_rx().bits() ^ (status as u8))
+                .stat_rx()
+                .bits(r.stat_rx().bits() ^ (status as u8))
         });
     }
 
     pub fn set_stat_tx(&self, _cs: &CriticalSection, status: EndpointStatus) {
         self.reg().modify(|r, w| {
             Self::set_invariant_values(w)
-                .stat_tx().bits(r.stat_tx().bits() ^ (status as u8))
+                .stat_tx()
+                .bits(r.stat_tx().bits() ^ (status as u8))
         });
     }
 }
